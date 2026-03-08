@@ -24,7 +24,8 @@ with st.sidebar:
     st.caption("Upload PDFs -> Ask Questions -> Get Answers")
 
 # Accept key from input or .env
-api_key = api_key_input or os.getenv("GROQ_API_KEY")
+api_key = api_key_input or st.secrets["GROQ_API_KEY"]
+
 
 if not api_key:
     st.warning("Please enter your Groq API Key (or set GROQ_API_KEY in .env)")
@@ -206,4 +207,5 @@ if user_q:
     with st.expander("📑 Retrieved Chunks"):
         for i, doc in enumerate(docs, 1):
             st.markdown(f"**{i}. {doc.metadata.get('source_file', 'Unknown')} (p{doc.metadata.get('page', '?')})**")
+
             st.write(doc.page_content[:500] + ("..." if len(doc.page_content) > 500 else ""))
