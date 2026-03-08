@@ -1,0 +1,209 @@
+import os
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+# setup : env + streamlit page
+load_dotenv()
+
+st.set_page_config(page_title="📝 Rag Q&A", layout="wide")
+st.title("📝 RAG Q&A with Multiple PDFs + Chat History")
+
+## sidebar config:
+with st.sidebar:
+    st.header("Config")
+    api_key_input = st.text_input("Groq API Key", type="password")
+    st.caption("Upload PDFs -> Ask Questions -> Get Answers")
+
+# Accept key from input or .env
+api_key = api_key_input or os.getenv("GROQ_API_KEY")
+
+if not api_key:
+    st.warning("Please enter your Groq API Key (or set GROQ_API_KEY in .env)")
+    st.stop()
+
+## embeddings and llm initialization
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    encode_kwargs={"normalize_embeddings": True}
+)
+
+llm = ChatGroq(
+    groq_api_key=api_key,
+    model_name='llama-3.1-8b-instant'
+)
+
+uploaded_files = st.file_uploader(
+    "Upload PDF files",
+    type="pdf",
+    accept_multiple_files=True
+)
+
+if not uploaded_files:
+    st.info("Please Upload one or more PDFs to begin")
+    st.stop()
+
+all_docs = []
+tmp_paths = []
+
+for pdf in uploaded_files:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(pdf.getvalue())
+    tmp.close()
+    tmp_paths.append(tmp.name)
+
+    loader = PyPDFLoader(tmp.name)
+    docs = loader.load()
+
+    for d in docs:
+        d.metadata["source_file"] = pdf.name
+
+    all_docs.extend(docs)
+
+st.success(f"Loaded {len(all_docs)} pages from {len(uploaded_files)} PDFs")
+
+# Clean up temp files
+for p in tmp_paths:
+    try:
+        os.unlink(p)
+    except Exception:
+        pass
+
+# Chunking (split text)
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1200,
+    chunk_overlap=120
+)
+
+splits = text_splitter.split_documents(all_docs)
+
+# ── Vectorstore: FAISS with persistent on-disk storage
+
+INDEX_DIR = "faiss_index"
+
+# Load existing FAISS index from disk if it exists,
+# otherwise create a new one and save it.
+
+if os.path.exists(INDEX_DIR):
+    vectorstore = FAISS.load_local(
+        INDEX_DIR,
+        embeddings,
+        allow_dangerous_deserialization=True 
+    )
+    # Merge newly uploaded docs into the existing index
+    new_vectorstore = FAISS.from_documents(splits, embeddings)
+    vectorstore.merge_from(new_vectorstore)
+else:
+    vectorstore = FAISS.from_documents(splits, embeddings)
+
+# Save/persist the updated index to disk
+vectorstore.save_local(INDEX_DIR)
+
+retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 5, "fetch_k": 20}
+)
+
+st.sidebar.write(f"🔍 Indexed {len(splits)} chunks for retrieval")
+st.sidebar.write(f"💾 FAISS index saved to: `{INDEX_DIR}/`")
+
+# ── Helper: format docs for stuffing
+def _join_docs(docs, max_chars=7000):
+    chunks, total = [], 0
+    for d in docs:
+        piece = d.page_content
+        if total + len(piece) > max_chars:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return "\n\n---\n\n".join(chunks)
+
+# Prompts
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "Rewrite the user's latest question into a standalone search query using the chat history for context. "
+     "Return only the rewritten query, no extra text."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}")
+])
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a STRICT RAG assistant. You must answer using ONLY the provided context.\n"
+     "If the context does NOT contain the answer, reply exactly:\n"
+     "'Out of scope - not found in provided documents.'\n"
+     "Do NOT use outside knowledge.\n\n"
+     "Context:\n{context}"),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}")
+])
+
+# Session state for chat history (multi sessions)
+if "chathistory" not in st.session_state:
+    st.session_state.chathistory = {}
+
+def get_history(session_id: str):
+    if session_id not in st.session_state.chathistory:
+        st.session_state.chathistory[session_id] = ChatMessageHistory()
+    return st.session_state.chathistory[session_id]
+
+# Chat UI 
+session_id = st.text_input("🆔 Session ID", value="default_session")
+user_q = st.chat_input("💬 Ask a question...")
+
+if user_q:
+    history = get_history(session_id)
+
+    # 1) Rewrite question with history
+    rewrite_msgs = contextualize_q_prompt.format_messages(
+        chat_history=history.messages,
+        input=user_q
+    )
+    standalone_q = llm.invoke(rewrite_msgs).content.strip()
+
+    # 2) Retrieve chunks
+    docs = retriever.invoke(standalone_q)
+
+    if not docs:
+        answer = "Out of scope — not found in provided documents."
+        st.chat_message("user").write(user_q)
+        st.chat_message("assistant").write(answer)
+        history.add_user_message(user_q)
+        history.add_ai_message(answer)
+        st.stop()
+
+    # 3) Build context string
+    context_str = _join_docs(docs)
+
+    # 4) Ask final question with stuffed context
+    qa_msgs = qa_prompt.format_messages(
+        chat_history=history.messages,
+        input=user_q,
+        context=context_str
+    )
+    answer = llm.invoke(qa_msgs).content
+
+    st.chat_message("user").write(user_q)
+    st.chat_message("assistant").write(answer)
+
+    history.add_user_message(user_q)
+    history.add_ai_message(answer)
+
+    # Debug panels
+    with st.expander("🧪 Debug: Rewritten Query & Retrieval"):
+        st.write("**Rewritten (standalone) query:**")
+        st.code(standalone_q or "(empty)", language="text")
+        st.write(f"**Retrieved {len(docs)} chunk(s).**")
+
+    with st.expander("📑 Retrieved Chunks"):
+        for i, doc in enumerate(docs, 1):
+            st.markdown(f"**{i}. {doc.metadata.get('source_file', 'Unknown')} (p{doc.metadata.get('page', '?')})**")
+            st.write(doc.page_content[:500] + ("..." if len(doc.page_content) > 500 else ""))
